@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "1.0.0",
+  "schemaVersion": "2.0.0",
   "providers": [
     {
       "skillId": "mutation-risk-preflight",
@@ -29,14 +29,14 @@
         {
           "targetArtifact": "task-envelope",
           "sources": [
-            "task-envelope"
+            "bootstrap:task-envelope"
           ],
           "operation": "select"
         },
         {
           "targetArtifact": "authorization-boundary",
           "sources": [
-            "task-envelope.authorization",
+            "bootstrap:task-envelope.authorization",
             "mutation-intent.authorizationRef"
           ],
           "operation": "combine"
@@ -98,7 +98,13 @@
         "A concrete mutation action and exact target are available.",
         "The check runs before the mutation."
       ],
-      "failureHandling": "Return a non-ready verdict and do not perform the mutation.",
+      "failureHandling": {
+        "missingInput": "needs-input",
+        "approvalRequired": "needs-approval",
+        "redesignRequired": "needs-redesign",
+        "invalidReport": "failed",
+        "retry": "new-preflight-after-input-change"
+      },
       "gate": {
         "kind": "precondition",
         "policy": "conditional",

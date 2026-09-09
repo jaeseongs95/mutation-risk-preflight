@@ -107,7 +107,7 @@ test("vendored TaskEnvelope snapshot checksum이 lock과 일치한다", async ()
   assert.equal(createHash("sha256").update(snapshot).digest("hex"), item.sha256);
   const parsed = JSON.parse(snapshot);
   assert.equal(parsed.$id, item.schemaId);
-  assert.equal(item.supplierVersion, "0.1.0");
+  assert.equal(item.supplierVersion, "0.2.0");
 });
 
 test("integration descriptor는 precondition gate이고 독립 감사로 가장하지 않는다", async () => {
