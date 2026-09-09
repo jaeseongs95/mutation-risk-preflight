@@ -5,7 +5,10 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
+import { contractErrors, validateMutationIntent } from "./schema-validation.mjs";
+
 const VERSION = "1.0.0";
+export const PREFLIGHT_VALIDITY_MINUTES = 15;
 const APPROVAL_ACTIONS = new Set(["delete", "deploy", "publish", "migrate", "permission-change", "billing", "global-config"]);
 const RECOVERY_ACTIONS = new Set(["delete", "overwrite", "deploy", "publish", "migrate", "permission-change", "billing", "global-config"]);
 const DATA_LOSS_ACTIONS = new Set(["delete", "overwrite", "migrate"]);
@@ -40,35 +43,51 @@ export function unsafeTarget(target) {
   return null;
 }
 
-function validateIntent(input) {
-  const errors = [];
-  const isDigest = (value) => /^sha256:[a-f0-9]{64}$/.test(value ?? "");
-  if (!input || typeof input !== "object" || Array.isArray(input)) return ["입력은 JSON object여야 합니다."];
-  if (input.schemaVersion !== VERSION) errors.push("schemaVersion must be 1.0.0");
-  if (typeof input.operationId !== "string" || !input.operationId) errors.push("operationId가 필요합니다.");
-  if (!APPROVAL_ACTIONS.has(input.actionClass) && !["overwrite", "move", "other"].includes(input.actionClass)) errors.push("actionClass가 유효하지 않습니다.");
-  if (!Array.isArray(input.targets) || input.targets.length === 0) errors.push("하나 이상의 target이 필요합니다.");
-  for (const target of input.targets ?? []) {
-    if (!["locator", "targetType", "environment", "expectedFingerprint"].every((key) => typeof target?.[key] === "string" && target[key])) errors.push("각 target에는 locator, targetType, environment, expectedFingerprint가 필요합니다.");
-    else if (!isDigest(target.expectedFingerprint)) errors.push("target expectedFingerprint가 유효하지 않습니다.");
-  }
-  for (const field of ["scopeRef", "authorizationRef", "recoveryPlan", "expectedBlastRadius", "plannedCommandOrTool"]) if (!input[field] || typeof input[field] !== "object") errors.push(`${field}가 필요합니다.`);
-  for (const field of ["approvalEvidenceRefs", "currentStateEvidenceRefs"]) if (!Array.isArray(input[field])) errors.push(`${field}는 배열이어야 합니다.`);
-  if (input.scopeRef && (!isDigest(input.scopeRef.digest) || !Array.isArray(input.scopeRef.includedTargets) || !Array.isArray(input.scopeRef.excludedTargets))) errors.push("scopeRef가 유효하지 않습니다.");
-  if (input.authorizationRef && (!isDigest(input.authorizationRef.digest) || !Array.isArray(input.authorizationRef.allowedActions) || !Array.isArray(input.authorizationRef.allowedTargets) || !Array.isArray(input.authorizationRef.environments))) errors.push("authorizationRef가 유효하지 않습니다.");
-  for (const approval of input.approvalEvidenceRefs ?? []) if (!isDigest(approval?.digest) || !Array.isArray(approval?.targetLocators) || !Array.isArray(approval?.environments) || Number.isNaN(Date.parse(approval?.expiresAt))) errors.push("approval evidence가 유효하지 않습니다.");
-  for (const evidence of input.currentStateEvidenceRefs ?? []) if (!isDigest(evidence?.digest) || !isDigest(evidence?.fingerprint) || typeof evidence?.targetLocator !== "string") errors.push("current state evidence가 유효하지 않습니다.");
-  if (input.plannedCommandOrTool && (typeof input.plannedCommandOrTool.tool !== "string" || typeof input.plannedCommandOrTool.action !== "string")) errors.push("plannedCommandOrTool이 유효하지 않습니다.");
-  if (input.expectedBlastRadius && (!Number.isInteger(input.expectedBlastRadius.affectedTargets) || input.expectedBlastRadius.affectedTargets < 1 || !Number.isInteger(input.expectedBlastRadius.affectedUsers) || typeof input.expectedBlastRadius.external !== "boolean" || typeof input.expectedBlastRadius.description !== "string")) errors.push("expectedBlastRadius가 유효하지 않습니다.");
-  return errors;
-}
-
 function targetDigestFor(input) {
   return digest(input.targets.map((target) => ({ ...target, locator: canonicalLocator(target.locator) })).sort((a, b) => a.locator.localeCompare(b.locator)));
 }
 
+function sortedCanonical(items) {
+  return [...items].sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b)));
+}
+
+function canonicalIntentForDigest(input, targetDigest) {
+  return {
+    operationId: input.operationId,
+    actionClass: input.actionClass,
+    plannedCommandOrTool: input.plannedCommandOrTool,
+    targetDigest,
+    scopeRef: {
+      ...input.scopeRef,
+      locator: canonicalLocator(input.scopeRef.locator),
+      includedTargets: input.scopeRef.includedTargets.map(canonicalLocator).sort(),
+      excludedTargets: input.scopeRef.excludedTargets.map(canonicalLocator).sort(),
+    },
+    authorizationRef: {
+      ...input.authorizationRef,
+      locator: canonicalLocator(input.authorizationRef.locator),
+      allowedActions: [...input.authorizationRef.allowedActions].sort(),
+      allowedTargets: input.authorizationRef.allowedTargets.map(canonicalLocator).sort(),
+      environments: [...input.authorizationRef.environments].sort(),
+    },
+    approvalEvidenceRefs: sortedCanonical(input.approvalEvidenceRefs.map((approval) => ({
+      ...approval,
+      locator: canonicalLocator(approval.locator),
+      targetLocators: approval.targetLocators.map(canonicalLocator).sort(),
+      environments: [...approval.environments].sort(),
+    }))),
+    currentStateEvidenceRefs: sortedCanonical(input.currentStateEvidenceRefs.map((evidence) => ({
+      ...evidence,
+      locator: canonicalLocator(evidence.locator),
+      targetLocator: canonicalLocator(evidence.targetLocator),
+    }))),
+    recoveryPlan: input.recoveryPlan,
+    expectedBlastRadius: input.expectedBlastRadius,
+  };
+}
+
 function actionDigestFor(input, targetDigest) {
-  return digest({ operationId: input.operationId, actionClass: input.actionClass, plannedCommandOrTool: input.plannedCommandOrTool, targetDigest, scopeDigest: input.scopeRef.digest, authorizationDigest: input.authorizationRef.digest });
+  return digest(canonicalIntentForDigest(input, targetDigest));
 }
 
 function refLocators(refs) {
@@ -97,15 +116,25 @@ function blockedReport(input, reasons, now) {
   const suppliedBlastRadius = safeInput.expectedBlastRadius;
   const blastRadius = suppliedBlastRadius
     && Number.isInteger(suppliedBlastRadius.affectedTargets)
+    && suppliedBlastRadius.affectedTargets >= 1
     && Number.isInteger(suppliedBlastRadius.affectedUsers)
+    && suppliedBlastRadius.affectedUsers >= 0
     && typeof suppliedBlastRadius.external === "boolean"
     && typeof suppliedBlastRadius.description === "string"
-    ? suppliedBlastRadius
+    && suppliedBlastRadius.description.length > 0
+    ? {
+      affectedTargets: suppliedBlastRadius.affectedTargets,
+      affectedUsers: suppliedBlastRadius.affectedUsers,
+      external: suppliedBlastRadius.external,
+      description: suppliedBlastRadius.description,
+    }
     : { affectedTargets: 1, affectedUsers: 0, external: false, description: "확인되지 않음" };
-  const targetDigest = digest((safeInput.targets ?? []).map((target) => ({ locator: canonicalLocator(target?.locator ?? "unknown") })));
+  const safeTargets = Array.isArray(safeInput.targets) ? safeInput.targets : [];
+  const targetDigest = digest(safeTargets.map((target) => ({ locator: canonicalLocator(target?.locator ?? "unknown") })));
+  const actionClass = APPROVAL_ACTIONS.has(safeInput.actionClass) || ["overwrite", "move", "other"].includes(safeInput.actionClass) ? safeInput.actionClass : "other";
   return {
-    schemaVersion: VERSION, operationId: safeInput.operationId || "unknown", actionDigest: digest({ invalid: true, operationId: safeInput.operationId ?? null }), targetDigest,
-    classification: { actionClass: safeInput.actionClass || "other", reversibility: "conditional", externalImpact: false, dataLossPotential: false, permissionImpact: false },
+    schemaVersion: VERSION, operationId: typeof safeInput.operationId === "string" && safeInput.operationId ? safeInput.operationId : "unknown", actionDigest: digest({ invalid: true, operationId: safeInput.operationId ?? null }), targetDigest,
+    classification: { actionClass, reversibility: "conditional", externalImpact: false, dataLossPotential: false, permissionImpact: false },
     checks: [{ checkId: "input-validity", state: "failed", evidenceRefs: [], message: reasons.join(" ") }],
     approval: { required: false, status: "not-required", evidenceRefs: [] }, recovery: { available: false, restoreTested: false, irreversibilityAccepted: false, evidenceRefs: [] },
     blastRadius, unresolved: reasons,
@@ -115,8 +144,7 @@ function blockedReport(input, reasons, now) {
 
 export function evaluatePreflight(input, options = {}) {
   const now = options.now ? new Date(options.now) : new Date();
-  const validityMinutes = Number.isInteger(options.validityMinutes) ? options.validityMinutes : 15;
-  const validationErrors = validateIntent(input);
+  const validationErrors = validateMutationIntent(input) ? [] : contractErrors(validateMutationIntent);
   if (Number.isNaN(now.getTime())) return blockedReport(input, ["평가 시각이 유효하지 않습니다."], new Date(0));
   if (validationErrors.length) return blockedReport(input, validationErrors, now);
 
@@ -177,8 +205,8 @@ export function evaluatePreflight(input, options = {}) {
     approval: { required: approvalRequired, status: approval.status, evidenceRefs: approval.refs },
     recovery: { available: input.recoveryPlan.available, restoreTested: Boolean(input.recoveryPlan.restoreTestEvidenceRef), irreversibilityAccepted: input.recoveryPlan.irreversibilityAccepted, evidenceRefs: recoveryRefs },
     blastRadius: input.expectedBlastRadius, unresolved: [...new Set(unresolved)],
-    invalidationTriggers: ["action 변경", "target 또는 environment 변경", "target fingerprint 변경", "scope 또는 authorization 변경", "승인 만료 또는 범위 변경", "복구 계획 변경"],
-    validUntil: new Date(now.getTime() + validityMinutes * 60_000).toISOString(), observedAt: now.toISOString(), verdict,
+    invalidationTriggers: ["action 또는 planned tool 변경", "target 또는 environment 변경", "current-state evidence 또는 fingerprint 변경", "scope 또는 authorization 변경", "승인 evidence의 만료 또는 범위 변경", "복구 계획 변경", "예상 blast radius 변경"],
+    validUntil: new Date(now.getTime() + PREFLIGHT_VALIDITY_MINUTES * 60_000).toISOString(), observedAt: now.toISOString(), verdict,
   };
 }
 

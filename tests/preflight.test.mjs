@@ -69,6 +69,72 @@ test("receipt는 대상 fingerprint, action과 만료 시각 변경을 거부한
   assert.equal(expired.errorCode, "STALE_REVISION");
 });
 
+test("receipt 유효기간 연장과 report 필드 변조를 거부한다", async () => {
+  const intent = await fixture("local-delete");
+  const report = evaluatePreflight(intent, { now: evaluationTime });
+  const extended = structuredClone(report);
+  extended.validUntil = "2029-01-01T00:00:00.000Z";
+  assert.equal(verifyReceipt({ report: extended, intent, verificationTime: "2027-01-01T00:00:00.000Z" }).valid, false);
+
+  const malformed = structuredClone(report);
+  malformed.unexpected = true;
+  const invalid = verifyReceipt({ report: malformed, intent, verificationTime: "2026-09-09T00:01:00.000Z" });
+  assert.equal(invalid.valid, false);
+  assert.equal(invalid.errorCode, "INVALID_INPUT");
+});
+
+test("approval·current-state·recovery·blast-radius evidence 교체를 거부한다", async () => {
+  const intent = await fixture("local-delete");
+  const report = evaluatePreflight(intent, { now: evaluationTime });
+  const mutations = [
+    (changed) => { changed.approvalEvidenceRefs[0].locator = "evidence/approval-replaced.json"; },
+    (changed) => { changed.currentStateEvidenceRefs[0].digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; },
+    (changed) => { changed.recoveryPlan.restoreTestEvidenceRef = "evidence/restore-test-replaced.json"; },
+    (changed) => { changed.expectedBlastRadius.description = "같은 수치지만 다른 영향 설명"; },
+  ];
+  for (const mutate of mutations) {
+    const changed = structuredClone(intent);
+    mutate(changed);
+    const result = verifyReceipt({ report, intent: changed, verificationTime: "2026-09-09T00:01:00.000Z" });
+    assert.equal(result.valid, false);
+    assert.equal(result.errorCode, "STALE_REVISION");
+  }
+});
+
+test("supplied digest가 같아도 scope·authorization 실제 내용 변경을 거부한다", async () => {
+  const intent = await fixture("local-delete");
+  const report = evaluatePreflight(intent, { now: evaluationTime });
+  const scopeChanged = structuredClone(intent);
+  scopeChanged.scopeRef.excludedTargets.push("D:/repo/unrelated");
+  assert.equal(verifyReceipt({ report, intent: scopeChanged, verificationTime: "2026-09-09T00:01:00.000Z" }).valid, false);
+  const authorizationChanged = structuredClone(intent);
+  authorizationChanged.authorizationRef.allowedActions.push("publish");
+  assert.equal(verifyReceipt({ report, intent: authorizationChanged, verificationTime: "2026-09-09T00:01:00.000Z" }).valid, false);
+});
+
+test("intent와 report는 verifyReceipt에서 JSON Schema로 엄격 검증된다", async () => {
+  const intent = await fixture("local-delete");
+  const report = evaluatePreflight(intent, { now: evaluationTime });
+  const malformedIntent = structuredClone(intent);
+  malformedIntent.extra = true;
+  const result = verifyReceipt({ report, intent: malformedIntent, verificationTime: "2026-09-09T00:01:00.000Z" });
+  assert.equal(result.valid, false);
+  assert.equal(result.errorCode, "INVALID_INPUT");
+});
+
+test("계약 위반 intent도 schema-valid BLOCKED 보고서로 정규화한다", async () => {
+  const intent = await fixture("local-delete");
+  intent.operationId = 42;
+  intent.targets = { locator: "D:/repo/file.txt" };
+  intent.expectedBlastRadius.unexpected = true;
+  const report = evaluatePreflight(intent, { now: evaluationTime });
+  const schema = JSON.parse(await readFile(path.join(root, "contracts", "mutation-preflight-report.v1.schema.json"), "utf8"));
+  const ajv = new Ajv2020({ strict: true, formats: { "date-time": true } });
+  const validate = ajv.compile(schema);
+  assert.equal(report.verdict, "BLOCKED");
+  assert.equal(validate(report), true, JSON.stringify(validate.errors));
+});
+
 test("Windows drive·UNC root와 변수·glob target은 안전하지 않다", async () => {
   assert.equal(canonicalLocator("D:\\Repo\\file.txt"), "d:/Repo/file.txt");
   for (const locator of ["C:\\", "\\\\server\\share", "%USERPROFILE%\\x", "D:\\repo\\*", "~"]) {
@@ -94,7 +160,8 @@ test("JSON CLI는 MCP와 suite import 없이 직접 실행되고 아무 파일�
   assert.equal(await directoryDigest(fixturesRoot), before);
   const source = [
     await readFile(path.join(root, "scripts", "evaluate-preflight.mjs"), "utf8"),
-    await readFile(path.join(root, "scripts", "verify-preflight-receipt.mjs"), "utf8")
+    await readFile(path.join(root, "scripts", "verify-preflight-receipt.mjs"), "utf8"),
+    await readFile(path.join(root, "scripts", "schema-validation.mjs"), "utf8")
   ].join("\n");
   assert.doesNotMatch(source, /agent-governance-suite|mcp-server|skills\\registry/);
   assert.doesNotMatch(source, /node:child_process|\bwriteFile\b|\bunlink\b|\brename\b|\brmSync\b|\bfetch\s*\(/);

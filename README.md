@@ -43,7 +43,7 @@ pnpm lint
 pnpm test
 ~~~
 
-테스트는 실제 mutation API나 filesystem 변경 함수를 호출하지 않는 불변조건, Windows 경로, receipt 만료·변경, upstream checksum과 독립 실행을 확인합니다.
+테스트는 실제 mutation API나 filesystem 변경 함수를 호출하지 않는 불변조건, Windows 경로, receipt 변조·연장과 모든 invalidation 입력의 변경, upstream checksum과 독립 실행을 확인합니다.
 
 ## 라이선스
 
